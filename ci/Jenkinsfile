@@ -1,0 +1,286 @@
+pipeline {
+  agent {
+    kubernetes {
+      yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  nodeSelector:
+    node-role: cpu
+  securityContext:
+    fsGroup: 1000
+  containers:
+  - name: jnlp
+    volumeMounts:
+    - name: gitea-cred
+      mountPath: /home/jenkins/gitea-cred
+      readOnly: true
+  - name: buildah
+    image: quay.io/buildah/stable:v1.37.0
+    command: ["sleep"]
+    args: ["infinity"]
+    env:
+    - name: CONTAINERS_REGISTRIES_CONF
+      value: /etc/containers/registries.conf
+    - name: BUILDAH_ISOLATION
+      value: chroot
+    - name: STORAGE_DRIVER
+      value: vfs
+    securityContext:
+      runAsUser: 0
+      allowPrivilegeEscalation: true
+    volumeMounts:
+    - name: registries-conf
+      mountPath: /etc/containers/registries.conf
+      subPath: registries.conf
+    - name: containers-storage
+      mountPath: /var/lib/containers
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+  - name: test
+    image: python:3.11-slim
+    command: ["sleep"]
+    args: ["infinity"]
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+  volumes:
+  - name: registries-conf
+    configMap:
+      name: buildah-registries
+  - name: containers-storage
+    persistentVolumeClaim:
+      claimName: buildah-storage-router
+  - name: gitea-cred
+    secret:
+      secretName: gitea-netrc
+      defaultMode: 0440
+'''
+    }
+  }
+
+  triggers {
+    GenericTrigger(
+      genericVariables: [
+        [key: 'GIT_REF',      value: '$.ref'],
+        [key: 'GIT_BEFORE',   value: '$.before'],
+        [key: 'GIT_AFTER',    value: '$.after'],
+        [key: 'GIT_REPO_URL', value: '$.repository.clone_url'],
+        [key: 'GIT_PUSHER',   value: '$.pusher.username']
+      ],
+      tokenCredentialId: 'platform-webhook-token',
+      causeString: 'Gitea push $GIT_REF ($GIT_AFTER) by $GIT_PUSHER',
+      printContributedVariables: false,
+      printPostContent: false
+    )
+  }
+
+  options {
+    disableConcurrentBuilds()
+  }
+
+  environment {
+    REGISTRY       = 'k3d-sre-registry:5000'
+    IMAGE_NAME     = 'platform/ai-infra-platform-router'
+    DOCKERFILE     = 'Dockerfile'
+    BUILD_CTX      = '.'
+    GITOPS_REPO    = 'http://gitea:3000/fei232401/sre-lab.git'
+    GITOPS_FILE    = 'sre-lab-gitops/production/apps/ai-platform/router.yaml'
+    PIP_INDEX      = 'https://pypi.tuna.tsinghua.edu.cn/simple'
+    SERVICE_NAME   = 'ai-infra-platform-router'
+    PIPELINE_TITLE = 'platform router CI'
+    GIT_TERMINAL_PROMPT = '0'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Trigger Guard') {
+      steps {
+        script {
+          env.SHOULD_BUILD = 'true'
+          def before = (env.GIT_BEFORE ?: '').trim()
+          def zero   = '0' * 40
+          def base   = ''
+          if (before && before != zero && sh(script: "git cat-file -e ${before}^{commit} && echo ok || echo no", returnStdout: true).trim() == 'ok') {
+            base = before
+            echo "本次推送范围: ${before.substring(0,7)}..${(env.GIT_AFTER ?: 'HEAD').take(7)}(由 webhook 提供)"
+          } else {
+            base = 'HEAD~1'
+            echo "webhook 未提供可比对的起点,退回只看最后一个提交"
+          }
+          def GIT = 'git -c core.quotePath=false'
+          def changed = sh(script: """
+            if ${GIT} rev-parse --verify ${base} >/dev/null 2>&1; then
+              ${GIT} diff --name-only ${base} HEAD
+            else
+              echo __UNKNOWN__
+            fi
+          """, returnStdout: true).trim()
+          echo "本次推送涉及的文件: ${changed}"
+          if (changed == '__UNKNOWN__') {
+            echo "无法比对,保守起见照常构建"
+          } else {
+            def relevant = changed.readLines().any { p ->
+              p.startsWith('src/') || p.startsWith('tests/') || p.startsWith('ci/') ||
+              p == 'Dockerfile' || p.startsWith('requirements') || p == 'pytest.ini'
+            }
+            if (relevant) {
+              echo "命中构建路径,继续流水线"
+            } else {
+              env.SHOULD_BUILD = 'false'
+              echo "本次推送未触及代码/依赖/流水线路径,跳过构建"
+            }
+          }
+        }
+      }
+    }
+
+    stage('Resolve Tag') {
+      when { expression { env.SHOULD_BUILD == 'true' } }
+      steps {
+        script {
+          env.SHORT_SHA = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
+          env.IMAGE_REF = "${env.REGISTRY}/${env.IMAGE_NAME}:${env.SHORT_SHA}"
+          echo "镜像将构建为: ${env.IMAGE_REF}"
+        }
+      }
+    }
+
+    stage('Test') {
+      when { expression { env.SHOULD_BUILD == 'true' } }
+      steps {
+        // 本服务不拥有 schema，所以没有 Fetch Schema / Migrate —— 与 api 版的关键差异。
+        // 但**有测试**：加权采样是纯函数，分布断言能证明"按分数加权"不是空话。
+        container('test') {
+          sh '''
+            set -e
+            pip install --no-cache-dir -q --index-url ${PIP_INDEX} -r requirements-dev.txt
+            python -m pytest -q
+          '''
+        }
+      }
+    }
+
+    stage('Build') {
+      when { expression { env.SHOULD_BUILD == 'true' } }
+      steps {
+        container('buildah') {
+          sh '''
+            buildah bud \
+              --storage-driver=vfs \
+              --isolation=chroot \
+              --format=docker \
+              --build-arg GIT_SHA=${SHORT_SHA} \
+              --build-arg PIP_INDEX_URL=${PIP_INDEX} \
+              -t ${IMAGE_REF} \
+              -f ${DOCKERFILE} \
+              ${BUILD_CTX}
+            buildah images --storage-driver=vfs | head -5
+          '''
+        }
+      }
+    }
+
+    stage('Push') {
+      when { expression { env.SHOULD_BUILD == 'true' } }
+      steps {
+        container('buildah') {
+          sh '''
+            buildah push \
+              --storage-driver=vfs \
+              --tls-verify=false \
+              ${IMAGE_REF} \
+              docker://${IMAGE_REF}
+          '''
+        }
+      }
+    }
+
+    stage('Verify In Registry') {
+      when { expression { env.SHOULD_BUILD == 'true' } }
+      steps {
+        container('buildah') {
+          sh '''
+            curl -sf "http://${REGISTRY}/v2/${IMAGE_NAME}/tags/list" | tee /tmp/tags.json
+            grep -q "${SHORT_SHA}" /tmp/tags.json
+            echo "镜像已在仓库中登记"
+          '''
+        }
+      }
+    }
+
+    stage('Update GitOps') {
+      when { expression { env.SHOULD_BUILD == 'true' } }
+      steps {
+        sh '''
+          set -e
+          install -m 600 /home/jenkins/gitea-cred/netrc $HOME/.netrc
+
+          rm -rf .gitops
+          git clone --depth 1 ${GITOPS_REPO} .gitops
+          cd .gitops
+          git config user.email "jenkins@platform-ci"
+          git config user.name  "Jenkins CI"
+
+          FILE=${GITOPS_FILE}
+
+          if [ ! -f "${FILE}" ]; then
+            echo "GitOps 清单 ${FILE} 尚不存在，本次跳过写回（先跑通镜像，人工落地清单）"
+            exit 0
+          fi
+
+          OLD_IMAGE=$(grep -oP "(?<=image: )${REGISTRY}/${IMAGE_NAME}:\\S+" ${FILE} || echo "none")
+          echo "旧镜像: ${OLD_IMAGE}"
+          echo "新镜像: ${IMAGE_REF}"
+
+          sed -i "s|image: ${REGISTRY}/${IMAGE_NAME}:.*|image: ${IMAGE_REF}|" ${FILE}
+
+          if git diff --quiet -- ${FILE}; then
+            echo "镜像 tag 未变化,跳过提交"
+            exit 0
+          fi
+
+          git add ${FILE}
+          git commit -m "ci: bump ai-infra-platform-router to ${SHORT_SHA}"
+
+          for i in 1 2 3; do
+            if git push ${GITOPS_REPO} HEAD:main; then
+              echo "GitOps 已写回(第 ${i} 次尝试)"
+              exit 0
+            fi
+            echo "推送被拒,拉取远端后重放本地提交(第 ${i} 次)"
+            git fetch ${GITOPS_REPO} main
+            git rebase FETCH_HEAD || { git rebase --abort; exit 1; }
+            sleep 2
+          done
+          echo "三次写回均失败"
+          exit 1
+        '''
+      }
+    }
+
+  }
+
+  post {
+    success {
+      echo "流水线成功: ${env.IMAGE_REF ?: '本次推送未触及构建路径,已跳过构建'}"
+    }
+    failure {
+      echo "流水线失败,检查各 stage 日志"
+    }
+  }
+}
