@@ -7,14 +7,17 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Response
+from prometheus_client import make_asgi_app
 from pydantic import BaseModel, Field
 
 from .config import get_settings
+from .metrics import observe_record_failure, observe_route, observe_upstream_error
 from .picking import POLICIES, normalize, pick
 
 logger = logging.getLogger("router")
 
 app = FastAPI(title="ai-infra-platform-router", version="0.1.0")
+app.mount("/metrics", make_asgi_app())
 
 
 class RouteIn(BaseModel):
@@ -227,6 +230,10 @@ async def route(
 
         status = "success" if error_code is None else "error"
         total_ms = round((time.perf_counter() - clock) * 1000, 2)
+        observe_route(str(backend["name"]), str(backend["engine"]), policy,
+                      status, total_ms / 1000, len(candidates), payload.model_name)
+        if error_code is not None:
+            observe_upstream_error(error_code)
         decision = {
             "policy": policy,
             "candidate_ids": [int(item["backend_id"]) for item in candidates],
@@ -258,6 +265,8 @@ async def route(
             recorded = request_id is not None
         except Exception as exc:
             logger.warning("写入请求日志异常: %r", exc)
+        if not recorded:
+            observe_record_failure()
 
     if error_code is not None:
         raise HTTPException(
