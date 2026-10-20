@@ -1,5 +1,7 @@
 # ai-infra-platform-router
 
+> **已归档（2026-10）**：本仓库已合并到 [inference-platform](https://github.com/fei232401/inference-platform) 的 `services/router/`，后续开发和修复都在那里进行。本仓库保留合并前的历史状态，下面的说明和数字可能已经过时。来源路径与提交记录见主仓库的 `docs/source-provenance.json`。
+
 **决策执行器**：它是「控制层算出的路由决策」与「真实推理后端」之间缺的那一环。
 
 ## 它解决什么问题
